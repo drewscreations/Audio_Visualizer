@@ -1,10 +1,11 @@
 import sys
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton
-from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QComboBox
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal
 from scipy.signal import ShortTimeFFT, convolve
 from scipy.signal.windows import gaussian
+import pyaudio
 
 class RollingBuffer:
     def __init__(self, shape, fs=8000):
@@ -33,6 +34,41 @@ class RollingBuffer:
             cropped_data = self.buffer[-num_samples:]
         return cropped_data
 
+class AudioStreamHandler(QThread):
+    data_ready = pyqtSignal(np.ndarray)
+
+    def __init__(self, stream_index, sample_rate=8000, chunk_size=1024, parent=None):
+        super().__init__(parent)
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
+        self.stream_index = stream_index
+        self.running = False
+
+        self.p = pyaudio.PyAudio()
+        device_info = self.p.get_device_info_by_index(self.stream_index)
+        print(device_info)
+        self.channels = min(device_info.get('maxInputChannels', 1), 1)
+        self.stream = self.p.open(format=pyaudio.paInt16,
+                                  channels=self.channels,
+                                  rate=self.sample_rate,
+                                  input=True,
+                                  input_device_index=self.stream_index,
+                                  frames_per_buffer=self.chunk_size)
+
+    def run(self):
+        self.running = True
+        while self.running:
+            data = self.stream.read(self.chunk_size, exception_on_overflow=False)
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            self.data_ready.emit(audio_data)
+
+    def stop(self):
+        self.running = False
+        self.stream.stop_stream()
+        self.stream.close()
+        self.p.terminate()
+
+
 class SignalGenerator:
     def __init__(self, frequency, sample_rate, amplitude):
         self.frequency = frequency
@@ -53,6 +89,7 @@ class SpectrogramViewer(QMainWindow):
         super().__init__()
         
         self.generator = SignalGenerator(frequency=1000, sample_rate=8000, amplitude=1)
+        self.audio_handler = None
         self.fs = self.generator.sample_rate
         self.plot_update_ms = 100
         self.data_update_ms = 50
@@ -64,9 +101,12 @@ class SpectrogramViewer(QMainWindow):
         self.sfft_buffer = RollingBuffer((200, 500))  # Assuming 500 is the FFT size
         self.raw_data_buffer = RollingBuffer(self.total_samples)
         self.initUI()
-        self.timer_running = True  # Timer is initially running
+        self.list_audio_devices()
+        
 
     def initUI(self):
+        self.setWindowTitle("Spectrogram From Stream")
+        self.setGeometry(2540, 100, 600, 400)
         self.central_widget = QWidget()  # Central widget to hold the layout
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout()  # Vertical layout
@@ -90,16 +130,17 @@ class SpectrogramViewer(QMainWindow):
         # Ensure x-axes are linked
         self.signal_plot_widget.setXLink(self.spectrogram_plot_widget)
         data = self.generator.generate(self.plot_window_len_s, add_noise=True, noise_freq=100)
-        self.Sx = self.calc_spectrogram(data)
+        self.Sx = self.calc_spectrogram(data) #(80009, 65)
         
         # Timer to update plots
         self.timer = QTimer()
         self.timer.timeout.connect(self.update)
         self.timer.start(self.plot_update_ms) 
+        self.timer_running = True
         
-        self.dataStreamTimer = QTimer()
-        self.dataStreamTimer.timeout.connect(self.addNewData)
-        self.dataStreamTimer.start(self.data_update_ms)
+        #self.dataStreamTimer = QTimer()
+        #self.dataStreamTimer.timeout.connect(self.addNewData)
+        #self.dataStreamTimer.start(self.data_update_ms)
         
         self.noise_toggle_timer = QTimer()
         self.noise_toggle_timer.timeout.connect(self.toggle_noise)
@@ -109,6 +150,17 @@ class SpectrogramViewer(QMainWindow):
         self.toggle_button = QPushButton("Stop", self)
         self.toggle_button.clicked.connect(self.toggle_timer)
         self.layout.addWidget(self.toggle_button)
+        
+        self.device_combo = QComboBox()
+        self.layout.addWidget(self.device_combo)
+
+        self.start_button = QPushButton('Start Audio Stream')
+        self.start_button.clicked.connect(self.start_audio_stream)
+        self.layout.addWidget(self.start_button)
+
+        self.stop_button = QPushButton('Stop Audio Stream')
+        self.stop_button.clicked.connect(self.stop_audio_stream)
+        self.layout.addWidget(self.stop_button)
 
     def toggle_noise(self):
         #self.use_noise = not self.use_noise
@@ -125,6 +177,32 @@ class SpectrogramViewer(QMainWindow):
             self.timer.start(self.plot_update_ms)
             self.toggle_button.setText("Stop")
         self.timer_running = not self.timer_running
+
+    def list_audio_devices(self):
+        p = pyaudio.PyAudio()
+        device_count = p.get_device_count()
+        for i in range(device_count):
+            device_info = p.get_device_info_by_index(i)
+            self.device_combo.addItem(device_info['name'], i)
+        p.terminate()
+
+    def start_audio_stream(self):
+        self.stop_audio_stream()
+        stream_index = self.device_combo.currentData()
+        self.audio_handler = AudioStreamHandler(stream_index)
+        self.audio_handler.data_ready.connect(self.handle_audio_data)
+        self.audio_handler.start()
+
+    def stop_audio_stream(self):
+        if self.audio_handler:
+            self.audio_handler.stop()
+            self.audio_handler = None
+
+    def handle_audio_data(self, data):
+        # Handle audio data (e.g., update plots)
+        #print(audio_data)
+        self.raw_data_buffer.add(data)
+        self.get_spectrogram_data(data)
 
     def calc_spectrogram(self, data):
         g_std = 8  # standard deviation for Gaussian window in samples
