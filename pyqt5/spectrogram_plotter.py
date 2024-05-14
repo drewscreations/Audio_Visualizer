@@ -1,8 +1,9 @@
+from collections import deque
 import sys
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QComboBox
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox, QLabel, QSlider
+from PyQt5.QtCore import QTimer, QThread, Qt, pyqtSignal
 from scipy.signal import ShortTimeFFT, convolve
 from scipy.signal.windows import gaussian
 import pyaudio
@@ -90,6 +91,7 @@ class SpectrogramViewer(QMainWindow):
         
         self.generator = SignalGenerator(frequency=1000, sample_rate=8000, amplitude=1)
         self.audio_handler = None
+        self.data_queue = deque(maxlen=10*8000//1024)  # Store data for the last 10 seconds
         self.fs = self.generator.sample_rate
         self.plot_update_ms = 100
         self.data_update_ms = 50
@@ -101,6 +103,7 @@ class SpectrogramViewer(QMainWindow):
         self.sfft_buffer = RollingBuffer((200, 500))  # Assuming 500 is the FFT size
         self.raw_data_buffer = RollingBuffer(self.total_samples)
         self.initUI()
+        self.initTimers()
         self.list_audio_devices()
         
 
@@ -111,6 +114,12 @@ class SpectrogramViewer(QMainWindow):
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout()  # Vertical layout
         self.central_widget.setLayout(self.layout)
+
+        self.device_label = QLabel("Device Info: N/A")
+        self.layout.addWidget(self.device_label)
+
+        self.rate_label = QLabel("Average Stream Rate: N/A")
+        self.layout.addWidget(self.rate_label)
 
         # Signal plot
         self.signal_plot_widget = pg.PlotWidget(name='SignalPlot')
@@ -127,24 +136,34 @@ class SpectrogramViewer(QMainWindow):
         self.spectrogram_plot_widget.addItem(self.spectrogram_image)
         self.layout.addWidget(self.spectrogram_plot_widget)
 
+                # Controls for adjusting min and max levels
+        self.controls_layout = QHBoxLayout()
+        self.layout.addLayout(self.controls_layout)
+
+        # Min level slider
+        self.min_slider = QSlider(Qt.Horizontal)
+        self.min_slider.setRange(0, 100)
+        self.min_slider.setValue(1)
+        self.min_slider.label = QLabel('Min Level')
+        self.controls_layout.addWidget(self.min_slider.label)
+        self.controls_layout.addWidget(self.min_slider)
+        self.min_slider.valueChanged.connect(self.update_levels)
+
+        # Max level slider
+        self.max_slider = QSlider(Qt.Horizontal)
+        self.max_slider.setRange(1, 200)
+        self.max_slider.setValue(100)
+        self.max_slider.label = QLabel('Max Level')
+        self.controls_layout.addWidget(self.max_slider.label)
+        self.controls_layout.addWidget(self.max_slider)
+        self.max_slider.valueChanged.connect(self.update_levels)
+        self.update_levels()
         # Ensure x-axes are linked
         self.signal_plot_widget.setXLink(self.spectrogram_plot_widget)
         data = self.generator.generate(self.plot_window_len_s, add_noise=True, noise_freq=100)
         self.Sx = self.calc_spectrogram(data) #(80009, 65)
         
-        # Timer to update plots
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update)
-        self.timer.start(self.plot_update_ms) 
-        self.timer_running = True
-        
-        #self.dataStreamTimer = QTimer()
-        #self.dataStreamTimer.timeout.connect(self.addNewData)
-        #self.dataStreamTimer.start(self.data_update_ms)
-        
-        self.noise_toggle_timer = QTimer()
-        self.noise_toggle_timer.timeout.connect(self.toggle_noise)
-        self.noise_toggle_timer.start(3000)
+       
         
         # Start/Stop Button
         self.toggle_button = QPushButton("Stop", self)
@@ -162,6 +181,29 @@ class SpectrogramViewer(QMainWindow):
         self.stop_button.clicked.connect(self.stop_audio_stream)
         self.layout.addWidget(self.stop_button)
 
+    def initTimers(self):
+        # Timer to update plots
+        self.plotUpdateTimer = QTimer()
+        self.plotUpdateTimer.timeout.connect(self.update)
+        self.plotUpdateTimer.start(self.plot_update_ms) 
+        self.timer_running = True
+        
+        #self.dataStreamTimer = QTimer()
+        #self.dataStreamTimer.timeout.connect(self.addNewData)
+        #self.dataStreamTimer.start(self.data_update_ms)
+        
+        self.noise_toggle_timer = QTimer()
+        self.noise_toggle_timer.timeout.connect(self.toggle_noise)
+        self.noise_toggle_timer.start(3000)
+        
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.calculate_stream_rate)
+
+    def update_levels(self):
+        self.min_level = self.min_slider.value()
+        self.max_level = self.max_slider.value()
+        #self.update_spectrogram()
+
     def toggle_noise(self):
         #self.use_noise = not self.use_noise
         rand_val = np.random.random()
@@ -171,10 +213,10 @@ class SpectrogramViewer(QMainWindow):
 
     def toggle_timer(self):
         if self.timer_running:
-            self.timer.stop()
+            self.plotUpdateTimer.stop()
             self.toggle_button.setText("Start")
         else:
-            self.timer.start(self.plot_update_ms)
+            self.plotUpdateTimer.start(self.plot_update_ms)
             self.toggle_button.setText("Stop")
         self.timer_running = not self.timer_running
 
@@ -192,15 +234,29 @@ class SpectrogramViewer(QMainWindow):
         self.audio_handler = AudioStreamHandler(stream_index)
         self.audio_handler.data_ready.connect(self.handle_audio_data)
         self.audio_handler.start()
+        device_info = pyaudio.PyAudio().get_device_info_by_index(stream_index)
+        self.device_label.setText(f"Device Info: {device_info['name']}")
+        self.timer.start(2000)  # Start timer to calculate stream rate every 2 seconds
+
 
     def stop_audio_stream(self):
         if self.audio_handler:
             self.audio_handler.stop()
             self.audio_handler = None
 
+    def update_stream_rate(self, avg_rate):
+        self.rate_label.setText(f"Average Stream Rate: {avg_rate:.2f} Hz")
+
+    def calculate_stream_rate(self):
+        if self.data_queue:
+            avg_rate = sum(self.data_queue) / len(self.data_queue) / (1024 / 8000)
+            self.rate_label.setText(f"Average Stream Rate: {avg_rate:.2f} Hz")
+
+    
     def handle_audio_data(self, data):
         # Handle audio data (e.g., update plots)
         #print(audio_data)
+        self.data_queue.append(len(data))
         self.raw_data_buffer.add(data)
         self.get_spectrogram_data(data)
 
@@ -235,7 +291,8 @@ class SpectrogramViewer(QMainWindow):
         self.signal_curve.setData(x, y)
         Sx = self.Sx
         
-        self.spectrogram_image.setImage(Sx, autoLevels=True)
+        self.spectrogram_image.setImage(Sx, levels=(self.min_level, self.max_level),
+                                            autoLevels=False)
         self.spectrogram_image.setRect(pg.QtCore.QRectF(-self.plot_window_len_s, 0, self.plot_window_len_s, round(self.fs/2)))
 
     def closeEvent(self, event):
